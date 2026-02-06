@@ -16,7 +16,7 @@ This repo runs a simple polling bot that:
 Create a virtual environment and install deps:
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -51,7 +51,7 @@ export JITTER_SECONDS="1"                 # default 1 second
 Run:
 
 ```bash
-python bot.py
+python3 bot.py
 ```
 
 ## Troubleshooting
