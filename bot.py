@@ -19,8 +19,8 @@ from telegram import Bot
 
 # Instagram credentials — set via environment variables or edit directly.
 # Using a dedicated/fake account is recommended.
-IG_USERNAME = os.environ.get("IG_USERNAME", "YOUR_FAKE_ACCOUNT_USERNAME")
-IG_PASSWORD = os.environ.get("IG_PASSWORD", "YOUR_FAKE_ACCOUNT_PASSWORD")
+IG_USERNAME = os.environ.get("IG_USERNAME", "f2804334")
+IG_PASSWORD = os.environ.get("IG_PASSWORD", "12121212Ff.")
 
 # Telegram settings
 TELEGRAM_TOKEN = os.environ.get(
