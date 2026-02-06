@@ -1,210 +1,294 @@
-import requests
 import asyncio
 import os
-import random
+from itertools import islice
+
+import instaloader
+from instaloader.exceptions import (
+    BadCredentialsException,
+    ConnectionException,
+    LoginRequiredException,
+    PrivateProfileNotFollowedException,
+    ProfileNotExistsException,
+    TwoFactorAuthRequiredException,
+    TooManyRequestsException,
+)
 from telegram import Bot
 
-# --- 🔐 ANAHTAR HAVUZU (EN ÖNEMLİ KISIM) ---
-# Guerrilla Mail ile aldığın keyleri tırnak içinde, virgülle ayırarak yapıştır.
-API_KEYS = [
-    "0c01188cb4msh74b0acfcc245125p11b555jsn24b92abc748f", # Senin mevcut keyin
-    "KEY_2_BURAYA_YAPISTIR",
-    "KEY_3_BURAYA_YAPISTIR",
-    "KEY_4_BURAYA_YAPISTIR",
-    "KEY_5_BURAYA_YAPISTIR",
-    "KEY_6_BURAYA_YAPISTIR",
-    "KEY_7_BURAYA_YAPISTIR",
-    "KEY_8_BURAYA_YAPISTIR",
-    "KEY_9_BURAYA_YAPISTIR",
-    "KEY_10_BURAYA_YAPISTIR"
-]
+# Telegram config (prefer environment variables)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8502372148:AAGqwcMrkXMasZEhABLmHaE2HKLxOYeRjIY")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7075582251")
 
-# Ayarlar
-RAPID_API_HOST = "starapi1.p.rapidapi.com"
-TELEGRAM_TOKEN = "8502372148:AAGqwcMrkXMasZEhABLmHaE2HKLxOYeRjIY"
-CHAT_ID = "7075582251"
+# Instagram login config
+IG_USERNAME = os.getenv("IG_USERNAME")
+IG_PASSWORD = os.getenv("IG_PASSWORD")
+IG_SESSION_FILE = os.getenv("IG_SESSION_FILE", "ig_session")
 
-# Hedef ID Listesi (Senin verdiğin ID'ler)
-TARGET_IDS = [
-    "9158581810", "8540571400", "56893406476", "52778386307", 
-    "45521544431", "8916182875", "15181547765", "2859988906", "67619369047"
-]
+DOWNLOAD_DIR = os.getenv("IG_DOWNLOAD_DIR", "downloads")
 
 HISTORY_FILE = "gecmis_final.txt"
 
-# --- YARDIMCI FONKSİYONLAR ---
+# Targets can be numeric IDs or usernames.
+TARGETS = [
+    "9158581810",
+    "8540571400",
+    "56893406476",
+    "52778386307",
+    "45521544431",
+    "8916182875",
+    "15181547765",
+    "2859988906",
+    "67619369047",
+]
 
-def get_random_header():
-    """Havuzdan çalışan rastgele bir key seçer."""
-    # Placeholder (BURAYA...) olanları filtrele
-    valid_keys = [k for k in API_KEYS if "BURAYA" not in k and len(k) > 10]
-    
-    if not valid_keys:
-        print("❌ HATA: Listede hiç geçerli API Key yok! Lütfen bot.py dosyasını düzenle.")
-        return None
 
-    selected_key = random.choice(valid_keys)
-    return {
-        "x-rapidapi-key": selected_key,
-        "x-rapidapi-host": RAPID_API_HOST,
-        "Content-Type": "application/json"
-    }
+def get_int_env(name, default):
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"Invalid {name}='{raw}', using {default}.")
+        return default
+
+
+POST_LIMIT = get_int_env("IG_POST_LIMIT", 2)
+CHECK_INTERVAL_SECONDS = get_int_env("CHECK_INTERVAL_SECONDS", 43200)
+DOWNLOAD_TIMEOUT_SECONDS = get_int_env("IG_DOWNLOAD_TIMEOUT", 30)
+RATE_LIMIT_SLEEP_SECONDS = get_int_env("IG_RATE_LIMIT_SLEEP", 900)
+
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r") as f:
-            return set(line.strip() for line in f)
+        with open(HISTORY_FILE, "r") as handle:
+            return set(line.strip() for line in handle if line.strip())
     return set()
 
+
 def save_to_history(media_id):
-    with open(HISTORY_FILE, "a") as f:
-        f.write(f"{media_id}\n")
+    with open(HISTORY_FILE, "a") as handle:
+        handle.write(f"{media_id}\n")
+
 
 SENT_IDS = load_history()
 
+
 try:
     bot = Bot(token=TELEGRAM_TOKEN)
-except Exception as e:
-    print(f"Bot token hatası: {e}")
-    exit()
+except Exception as exc:
+    print(f"Telegram bot token error: {exc}")
+    raise SystemExit(1)
 
-# --- İSTEK FONKSİYONLARI ---
 
-def get_stories(user_id):
-    url = f"https://{RAPID_API_HOST}/instagram/user/get_stories"
-    payload = {"ids": [user_id]}
-    header = get_random_header()
-    if not header: return None
+def init_instaloader():
+    return instaloader.Instaloader(
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        save_metadata=False,
+        compress_json=False,
+        max_connection_attempts=3,
+        quiet=True,
+    )
 
-    try:
-        response = requests.post(url, json=payload, headers=header, timeout=30)
-        if response.status_code == 429:
-            print("⚠️ Bir anahtarın kotası doldu, diğer turda başkası seçilecek.")
-        return response.json()
-    except:
-        return None
 
-def get_posts(user_id):
-    url = f"https://{RAPID_API_HOST}/instagram/user/get_media"
-    payload = {"id": user_id, "count": 2}
-    header = get_random_header()
-    if not header: return None
+def ensure_login(loader):
+    if not IG_USERNAME:
+        print("Missing IG_USERNAME. Set it in the environment.")
+        return False
 
-    try:
-        response = requests.post(url, json=payload, headers=header, timeout=30)
-        return response.json()
-    except:
-        return None
-
-def extract_media_url(item):
-    video_url = None
-    image_url = None
-    
-    if 'video_versions' in item:
-        video_url = item['video_versions'][0]['url']
-    elif item.get('video_url'):
-        video_url = item['video_url']
-
-    if not video_url:
-        if 'image_versions2' in item:
-            candidates = item['image_versions2'].get('candidates', [])
-            if candidates: image_url = candidates[0]['url']
-        elif 'display_url' in item:
-            image_url = item['display_url']
-            
-    return video_url, image_url
-
-async def process_and_send_post(post_item, user_label):
-    post_id = str(post_item.get('pk') or post_item.get('id'))
-    
-    if post_id in SENT_IDS: return
-
-    print(f"   ✨ Yeni Post: {user_label}")
-
-    if 'carousel_media' in post_item and post_item['carousel_media']:
-        album = post_item['carousel_media']
-        total_slides = len(album)
-        
-        for i, slide in enumerate(album, 1):
-            vid, img = extract_media_url(slide)
-            caption = f"📮 Post (ID: {user_label}) - {i}/{total_slides}"
-            try:
-                if vid: await bot.send_video(chat_id=CHAT_ID, video=vid, caption=caption)
-                elif img: await bot.send_photo(chat_id=CHAT_ID, photo=img, caption=caption)
-                await asyncio.sleep(1) 
-            except: pass
-    else:
-        vid, img = extract_media_url(post_item)
-        caption = f"📮 Post (ID: {user_label})"
+    if os.path.exists(IG_SESSION_FILE):
         try:
-            if vid: await bot.send_video(chat_id=CHAT_ID, video=vid, caption=caption)
-            elif img: await bot.send_photo(chat_id=CHAT_ID, photo=img, caption=caption)
-        except: pass
+            loader.load_session_from_file(IG_USERNAME, IG_SESSION_FILE)
+            return True
+        except Exception as exc:
+            print(f"Session load failed, retrying login: {exc}")
+
+    if not IG_PASSWORD:
+        print("Missing IG_PASSWORD and no session file available.")
+        return False
+
+    try:
+        loader.login(IG_USERNAME, IG_PASSWORD)
+        loader.save_session_to_file(IG_SESSION_FILE)
+        return True
+    except TwoFactorAuthRequiredException:
+        print("Two-factor auth required. Create a session file with instaloader.")
+    except BadCredentialsException:
+        print("Bad Instagram credentials.")
+    except ConnectionException as exc:
+        print(f"Instagram connection error: {exc}")
+    return False
+
+
+def resolve_profile(loader, target):
+    try:
+        target_str = str(target)
+        if target_str.isdigit():
+            return instaloader.Profile.from_id(loader.context, int(target_str))
+        return instaloader.Profile.from_username(loader.context, target_str)
+    except ProfileNotExistsException:
+        print(f"Profile not found: {target}")
+    except (ConnectionException, LoginRequiredException) as exc:
+        print(f"Profile lookup failed for {target}: {exc}")
+    return None
+
+
+def guess_extension(url, is_video):
+    default = ".mp4" if is_video else ".jpg"
+    if not url:
+        return default
+    path = url.split("?", 1)[0]
+    _, ext = os.path.splitext(path)
+    ext = ext.lower()
+    if ext in {".jpg", ".jpeg", ".png", ".mp4"}:
+        return ext
+    return default
+
+
+def download_media(loader, url, file_prefix, is_video):
+    if not url:
+        print("Missing media URL; skipping.")
+        return None
+
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    extension = guess_extension(url, is_video)
+    file_path = os.path.join(DOWNLOAD_DIR, f"{file_prefix}{extension}")
+
+    try:
+        response = loader.context.session.get(
+            url, stream=True, timeout=DOWNLOAD_TIMEOUT_SECONDS
+        )
+        response.raise_for_status()
+        with open(file_path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+        return file_path
+    except Exception as exc:
+        print(f"Download failed: {exc}")
+        return None
+
+
+async def send_media_file(file_path, caption, is_video):
+    if not file_path:
+        return
+
+    try:
+        with open(file_path, "rb") as handle:
+            if is_video:
+                await bot.send_video(chat_id=CHAT_ID, video=handle, caption=caption)
+            else:
+                await bot.send_photo(chat_id=CHAT_ID, photo=handle, caption=caption)
+    except Exception as exc:
+        print(f"Telegram send failed: {exc}")
+    finally:
+        try:
+            os.remove(file_path)
+        except FileNotFoundError:
+            pass
+
+
+async def process_and_send_post(loader, post, user_label):
+    post_id = str(post.mediaid)
+    if post_id in SENT_IDS:
+        return
+
+    if post.typename == "GraphSidecar":
+        nodes = list(post.get_sidecar_nodes())
+        total_slides = len(nodes)
+        for index, node in enumerate(nodes, 1):
+            is_video = node.is_video
+            url = node.video_url if is_video else node.display_url
+            file_path = download_media(loader, url, f"{post_id}_{index}", is_video)
+            caption = f"Post ({user_label}) - {index}/{total_slides}"
+            await send_media_file(file_path, caption, is_video)
+            await asyncio.sleep(1)
+    else:
+        is_video = post.is_video
+        url = post.video_url if is_video else post.url
+        file_path = download_media(loader, url, post_id, is_video)
+        caption = f"Post ({user_label})"
+        await send_media_file(file_path, caption, is_video)
 
     SENT_IDS.add(post_id)
     save_to_history(post_id)
 
-async def send_story_media(media_item, caption):
-    media_id = str(media_item.get('pk') or media_item.get('id'))
-    if media_id in SENT_IDS: return
 
-    vid, img = extract_media_url(media_item)
-    try:
-        if vid:
-            print(f"   📹 Story (Video)...")
-            await bot.send_video(chat_id=CHAT_ID, video=vid, caption=caption)
-        elif img:
-            print(f"   📸 Story (Foto)...")
-            await bot.send_photo(chat_id=CHAT_ID, photo=img, caption=caption)
-        SENT_IDS.add(media_id)
-        save_to_history(media_id)
-        await asyncio.sleep(2)
-    except: pass
+async def send_story_media(loader, media_item, caption):
+    media_id = str(getattr(media_item, "mediaid", None) or getattr(media_item, "id", ""))
+    if not media_id:
+        return
+    if media_id in SENT_IDS:
+        return
+
+    is_video = media_item.is_video
+    url = media_item.video_url if is_video else media_item.url
+    file_path = download_media(loader, url, media_id, is_video)
+    if not file_path:
+        return
+
+    await send_media_file(file_path, caption, is_video)
+    SENT_IDS.add(media_id)
+    save_to_history(media_id)
+    await asyncio.sleep(2)
+
 
 async def main():
-    print("🚀 Bot Başlatıldı (API HAVUZ MODU)...")
-    
-    active_keys = [k for k in API_KEYS if 'BURAYA' not in k]
-    print(f"🔑 Aktif Key Sayısı: {len(active_keys)}")
-    
-    if len(active_keys) < 2:
-        print("⚠️ UYARI: Çok az key var! Lütfen Guerrilla Mail ile alıp listeyi doldur.")
+    print("Bot started (instaloader mode).")
+    print(f"Targets configured: {len(TARGETS)}")
 
-    print(f"👤 Hedef ID Sayısı: {len(TARGET_IDS)}")
-    print("-" * 30)
-    
+    loader = init_instaloader()
+    if not ensure_login(loader):
+        return
+
+    profiles = []
+    for target in TARGETS:
+        profile = resolve_profile(loader, target)
+        if profile:
+            profiles.append(profile)
+
+    if not profiles:
+        print("No valid targets found. Check TARGETS.")
+        return
+
     while True:
-        for user_id in TARGET_IDS:
-            user_label = str(user_id) 
+        for profile in profiles:
+            user_label = f"{profile.username} ({profile.userid})"
 
-            # Story
-            print(f"🔍 {user_label} story...")
-            s_data = get_stories(user_id)
-            if s_data:
-                try:
-                    reels = s_data.get('response', {}).get('body', {}).get('reels', {})
-                    items = reels.get(str(user_id), {}).get('items', [])
-                    for item in items: await send_story_media(item, f"🔔 Story (ID: {user_label})")
-                except: pass
+            print(f"Checking stories for {user_label}...")
+            try:
+                for story in loader.get_stories(userids=[profile.userid]):
+                    for item in story.get_items():
+                        await send_story_media(loader, item, f"Story ({user_label})")
+            except PrivateProfileNotFollowedException:
+                print(f"Stories unavailable (not following): {user_label}")
+            except TooManyRequestsException:
+                print("Rate limited by Instagram. Sleeping longer.")
+                await asyncio.sleep(RATE_LIMIT_SLEEP_SECONDS)
+            except Exception as exc:
+                print(f"Story error for {user_label}: {exc}")
 
             await asyncio.sleep(1)
 
-            # Post
-            print(f"🔍 {user_label} post...")
-            p_data = get_posts(user_id)
-            if p_data:
-                try:
-                    items = p_data.get('response', {}).get('body', {}).get('items', [])
-                    for item in items: await process_and_send_post(item, user_label)
-                except: pass
-            
+            print(f"Checking posts for {user_label}...")
+            try:
+                for post in islice(profile.get_posts(), POST_LIMIT):
+                    await process_and_send_post(loader, post, user_label)
+            except PrivateProfileNotFollowedException:
+                print(f"Posts unavailable (not following): {user_label}")
+            except TooManyRequestsException:
+                print("Rate limited by Instagram. Sleeping longer.")
+                await asyncio.sleep(RATE_LIMIT_SLEEP_SECONDS)
+            except Exception as exc:
+                print(f"Post error for {user_label}: {exc}")
+
             await asyncio.sleep(2)
 
-        # ✅ SÜRE: 12 SAAT (43200 Saniye)
-        print("✅ Tur bitti. 12 SAAT mola...")
-        await asyncio.sleep(43200)
+        print(f"Cycle complete. Sleeping {CHECK_INTERVAL_SECONDS} seconds.")
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
-  
+    asyncio.run(main())
