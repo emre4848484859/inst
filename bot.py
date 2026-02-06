@@ -1,210 +1,306 @@
-import requests
 import asyncio
 import os
-import random
+import json
+from datetime import datetime
+from instagrapi import Client
+from instagrapi.exceptions import LoginRequired, ChallengeRequired, PleaseWaitFewMinutes
 from telegram import Bot
+import time
 
-# --- 🔐 ANAHTAR HAVUZU (EN ÖNEMLİ KISIM) ---
-# Guerrilla Mail ile aldığın keyleri tırnak içinde, virgülle ayırarak yapıştır.
-API_KEYS = [
-    "0c01188cb4msh74b0acfcc245125p11b555jsn24b92abc748f", # Senin mevcut keyin
-    "KEY_2_BURAYA_YAPISTIR",
-    "KEY_3_BURAYA_YAPISTIR",
-    "KEY_4_BURAYA_YAPISTIR",
-    "KEY_5_BURAYA_YAPISTIR",
-    "KEY_6_BURAYA_YAPISTIR",
-    "KEY_7_BURAYA_YAPISTIR",
-    "KEY_8_BURAYA_YAPISTIR",
-    "KEY_9_BURAYA_YAPISTIR",
-    "KEY_10_BURAYA_YAPISTIR"
-]
+# --- 🔐 INSTAGRAM CREDENTIALS ---
+# Create a fake/throwaway Instagram account for this
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "YOUR_INSTAGRAM_USERNAME")
+INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "YOUR_INSTAGRAM_PASSWORD")
 
-# Ayarlar
-RAPID_API_HOST = "starapi1.p.rapidapi.com"
+# --- 📱 TELEGRAM SETTINGS ---
 TELEGRAM_TOKEN = "8502372148:AAGqwcMrkXMasZEhABLmHaE2HKLxOYeRjIY"
 CHAT_ID = "7075582251"
 
-# Hedef ID Listesi (Senin verdiğin ID'ler)
+# --- 🎯 TARGET ACCOUNTS ---
+# You can use either usernames or user IDs
+TARGET_USERNAMES = [
+    # Add Instagram usernames here, e.g., "username1", "username2"
+]
+
 TARGET_IDS = [
     "9158581810", "8540571400", "56893406476", "52778386307", 
     "45521544431", "8916182875", "15181547765", "2859988906", "67619369047"
 ]
 
+# --- 💾 FILES ---
 HISTORY_FILE = "gecmis_final.txt"
+SESSION_FILE = "instagram_session.json"
 
-# --- YARDIMCI FONKSİYONLAR ---
-
-def get_random_header():
-    """Havuzdan çalışan rastgele bir key seçer."""
-    # Placeholder (BURAYA...) olanları filtrele
-    valid_keys = [k for k in API_KEYS if "BURAYA" not in k and len(k) > 10]
-    
-    if not valid_keys:
-        print("❌ HATA: Listede hiç geçerli API Key yok! Lütfen bot.py dosyasını düzenle.")
-        return None
-
-    selected_key = random.choice(valid_keys)
-    return {
-        "x-rapidapi-key": selected_key,
-        "x-rapidapi-host": RAPID_API_HOST,
-        "Content-Type": "application/json"
-    }
+# --- 🔧 HELPER FUNCTIONS ---
 
 def load_history():
+    """Load previously sent media IDs"""
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE, "r") as f:
             return set(line.strip() for line in f)
     return set()
 
 def save_to_history(media_id):
+    """Save media ID to history"""
     with open(HISTORY_FILE, "a") as f:
         f.write(f"{media_id}\n")
+
+def load_session(cl):
+    """Load Instagram session from file"""
+    if os.path.exists(SESSION_FILE):
+        try:
+            cl.load_settings(SESSION_FILE)
+            print("✅ Session loaded from file")
+            return True
+        except Exception as e:
+            print(f"⚠️ Could not load session: {e}")
+    return False
+
+def save_session(cl):
+    """Save Instagram session to file"""
+    try:
+        cl.dump_settings(SESSION_FILE)
+        print("✅ Session saved")
+    except Exception as e:
+        print(f"⚠️ Could not save session: {e}")
+
+def instagram_login():
+    """Login to Instagram with session management"""
+    cl = Client()
+    cl.delay_range = [2, 5]  # Random delay between requests
+    
+    # Try to load existing session
+    if load_session(cl):
+        try:
+            cl.get_timeline_feed()  # Test if session is valid
+            print("✅ Logged in using saved session")
+            return cl
+        except LoginRequired:
+            print("⚠️ Session expired, logging in again...")
+    
+    # Login with credentials
+    try:
+        print("🔐 Logging in to Instagram...")
+        cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+        save_session(cl)
+        print("✅ Successfully logged in!")
+        return cl
+    except ChallengeRequired as e:
+        print("❌ Challenge required! Instagram wants verification.")
+        print("   Solution: Log in to your account manually from a browser/app first.")
+        raise e
+    except PleaseWaitFewMinutes:
+        print("❌ Rate limited! Please wait a few minutes.")
+        raise
+    except Exception as e:
+        print(f"❌ Login failed: {e}")
+        raise e
 
 SENT_IDS = load_history()
 
 try:
     bot = Bot(token=TELEGRAM_TOKEN)
 except Exception as e:
-    print(f"Bot token hatası: {e}")
+    print(f"❌ Telegram bot token error: {e}")
     exit()
 
-# --- İSTEK FONKSİYONLARI ---
+# --- 📸 INSTAGRAM API FUNCTIONS ---
 
-def get_stories(user_id):
-    url = f"https://{RAPID_API_HOST}/instagram/user/get_stories"
-    payload = {"ids": [user_id]}
-    header = get_random_header()
-    if not header: return None
-
+def get_user_stories(cl, user_id):
+    """Fetch user stories using instagrapi"""
     try:
-        response = requests.post(url, json=payload, headers=header, timeout=30)
-        if response.status_code == 429:
-            print("⚠️ Bir anahtarın kotası doldu, diğer turda başkası seçilecek.")
-        return response.json()
-    except:
-        return None
+        stories = cl.user_stories(int(user_id))
+        return stories if stories else []
+    except Exception as e:
+        print(f"   ⚠️ Error fetching stories: {e}")
+        return []
 
-def get_posts(user_id):
-    url = f"https://{RAPID_API_HOST}/instagram/user/get_media"
-    payload = {"id": user_id, "count": 2}
-    header = get_random_header()
-    if not header: return None
-
+def get_user_posts(cl, user_id, amount=2):
+    """Fetch recent user posts using instagrapi"""
     try:
-        response = requests.post(url, json=payload, headers=header, timeout=30)
-        return response.json()
-    except:
-        return None
+        medias = cl.user_medias(int(user_id), amount=amount)
+        return medias if medias else []
+    except Exception as e:
+        print(f"   ⚠️ Error fetching posts: {e}")
+        return []
 
-def extract_media_url(item):
-    video_url = None
-    image_url = None
+def download_media(cl, media_obj):
+    """Download media and return file path"""
+    try:
+        if media_obj.media_type == 1:  # Photo
+            path = cl.photo_download(media_obj.pk, folder="temp")
+            return path, "photo"
+        elif media_obj.media_type == 2 and media_obj.product_type == "feed":  # Video
+            path = cl.video_download(media_obj.pk, folder="temp")
+            return path, "video"
+        elif media_obj.media_type == 2 and media_obj.product_type == "story":  # Story video
+            path = cl.video_download(media_obj.pk, folder="temp")
+            return path, "video"
+        elif media_obj.media_type == 8:  # Carousel/Album
+            return None, "carousel"
+        else:
+            return None, "unknown"
+    except Exception as e:
+        print(f"   ⚠️ Error downloading media: {e}")
+        return None, None
+
+async def process_and_send_post(cl, media_obj, user_label):
+    """Process and send Instagram post to Telegram"""
+    post_id = str(media_obj.pk)
     
-    if 'video_versions' in item:
-        video_url = item['video_versions'][0]['url']
-    elif item.get('video_url'):
-        video_url = item['video_url']
+    if post_id in SENT_IDS:
+        return
 
-    if not video_url:
-        if 'image_versions2' in item:
-            candidates = item['image_versions2'].get('candidates', [])
-            if candidates: image_url = candidates[0]['url']
-        elif 'display_url' in item:
-            image_url = item['display_url']
+    print(f"   ✨ New Post: {user_label}")
+
+    try:
+        # Handle carousel/album posts
+        if media_obj.media_type == 8:
+            resources = media_obj.resources
+            total = len(resources)
             
-    return video_url, image_url
+            for i, resource in enumerate(resources, 1):
+                caption = f"📮 Post (ID: {user_label}) - {i}/{total}"
+                try:
+                    if resource.media_type == 1:  # Photo
+                        path = cl.photo_download(resource.pk, folder="temp")
+                        with open(path, 'rb') as photo:
+                            await bot.send_photo(chat_id=CHAT_ID, photo=photo, caption=caption)
+                        os.remove(path)
+                    elif resource.media_type == 2:  # Video
+                        path = cl.video_download(resource.pk, folder="temp")
+                        with open(path, 'rb') as video:
+                            await bot.send_video(chat_id=CHAT_ID, video=video, caption=caption)
+                        os.remove(path)
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    print(f"   ⚠️ Error sending carousel item: {e}")
+        else:
+            # Single photo or video
+            caption = f"📮 Post (ID: {user_label})\n{media_obj.caption_text[:100] if media_obj.caption_text else ''}"
+            path, media_type = download_media(cl, media_obj)
+            
+            if path and media_type == "photo":
+                with open(path, 'rb') as photo:
+                    await bot.send_photo(chat_id=CHAT_ID, photo=photo, caption=caption)
+                os.remove(path)
+            elif path and media_type == "video":
+                with open(path, 'rb') as video:
+                    await bot.send_video(chat_id=CHAT_ID, video=video, caption=caption)
+                os.remove(path)
 
-async def process_and_send_post(post_item, user_label):
-    post_id = str(post_item.get('pk') or post_item.get('id'))
+        SENT_IDS.add(post_id)
+        save_to_history(post_id)
+    except Exception as e:
+        print(f"   ❌ Error processing post: {e}")
+
+async def send_story_media(cl, story_obj, user_label):
+    """Send Instagram story to Telegram"""
+    media_id = str(story_obj.pk)
     
-    if post_id in SENT_IDS: return
+    if media_id in SENT_IDS:
+        return
 
-    print(f"   ✨ Yeni Post: {user_label}")
-
-    if 'carousel_media' in post_item and post_item['carousel_media']:
-        album = post_item['carousel_media']
-        total_slides = len(album)
-        
-        for i, slide in enumerate(album, 1):
-            vid, img = extract_media_url(slide)
-            caption = f"📮 Post (ID: {user_label}) - {i}/{total_slides}"
-            try:
-                if vid: await bot.send_video(chat_id=CHAT_ID, video=vid, caption=caption)
-                elif img: await bot.send_photo(chat_id=CHAT_ID, photo=img, caption=caption)
-                await asyncio.sleep(1) 
-            except: pass
-    else:
-        vid, img = extract_media_url(post_item)
-        caption = f"📮 Post (ID: {user_label})"
-        try:
-            if vid: await bot.send_video(chat_id=CHAT_ID, video=vid, caption=caption)
-            elif img: await bot.send_photo(chat_id=CHAT_ID, photo=img, caption=caption)
-        except: pass
-
-    SENT_IDS.add(post_id)
-    save_to_history(post_id)
-
-async def send_story_media(media_item, caption):
-    media_id = str(media_item.get('pk') or media_item.get('id'))
-    if media_id in SENT_IDS: return
-
-    vid, img = extract_media_url(media_item)
     try:
-        if vid:
+        caption = f"🔔 Story (ID: {user_label})"
+        path, media_type = download_media(cl, story_obj)
+        
+        if path and media_type == "photo":
+            print(f"   📸 Story (Photo)...")
+            with open(path, 'rb') as photo:
+                await bot.send_photo(chat_id=CHAT_ID, photo=photo, caption=caption)
+            os.remove(path)
+        elif path and media_type == "video":
             print(f"   📹 Story (Video)...")
-            await bot.send_video(chat_id=CHAT_ID, video=vid, caption=caption)
-        elif img:
-            print(f"   📸 Story (Foto)...")
-            await bot.send_photo(chat_id=CHAT_ID, photo=img, caption=caption)
+            with open(path, 'rb') as video:
+                await bot.send_video(chat_id=CHAT_ID, video=video, caption=caption)
+            os.remove(path)
+        
         SENT_IDS.add(media_id)
         save_to_history(media_id)
         await asyncio.sleep(2)
-    except: pass
+    except Exception as e:
+        print(f"   ❌ Error sending story: {e}")
 
 async def main():
-    print("🚀 Bot Başlatıldı (API HAVUZ MODU)...")
+    """Main bot loop"""
+    print("🚀 Bot Started (FREE - No API Cost!)...")
+    print(f"👤 Target Account Count: {len(TARGET_IDS)}")
+    print("-" * 50)
     
-    active_keys = [k for k in API_KEYS if 'BURAYA' not in k]
-    print(f"🔑 Aktif Key Sayısı: {len(active_keys)}")
+    # Check credentials
+    if INSTAGRAM_USERNAME == "YOUR_INSTAGRAM_USERNAME":
+        print("❌ ERROR: Please set your Instagram credentials!")
+        print("   Set environment variables or edit the file:")
+        print("   INSTAGRAM_USERNAME=your_username")
+        print("   INSTAGRAM_PASSWORD=your_password")
+        return
     
-    if len(active_keys) < 2:
-        print("⚠️ UYARI: Çok az key var! Lütfen Guerrilla Mail ile alıp listeyi doldur.")
-
-    print(f"👤 Hedef ID Sayısı: {len(TARGET_IDS)}")
-    print("-" * 30)
+    # Create temp directory for downloads
+    os.makedirs("temp", exist_ok=True)
+    
+    # Login to Instagram
+    try:
+        cl = instagram_login()
+    except Exception as e:
+        print(f"❌ Cannot continue without Instagram login: {e}")
+        return
+    
+    loop_count = 0
     
     while True:
+        loop_count += 1
+        print(f"\n{'='*50}")
+        print(f"🔄 Loop #{loop_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*50}")
+        
         for user_id in TARGET_IDS:
-            user_label = str(user_id) 
-
-            # Story
-            print(f"🔍 {user_label} story...")
-            s_data = get_stories(user_id)
-            if s_data:
-                try:
-                    reels = s_data.get('response', {}).get('body', {}).get('reels', {})
-                    items = reels.get(str(user_id), {}).get('items', [])
-                    for item in items: await send_story_media(item, f"🔔 Story (ID: {user_label})")
-                except: pass
-
-            await asyncio.sleep(1)
-
-            # Post
-            print(f"🔍 {user_label} post...")
-            p_data = get_posts(user_id)
-            if p_data:
-                try:
-                    items = p_data.get('response', {}).get('body', {}).get('items', [])
-                    for item in items: await process_and_send_post(item, user_label)
-                except: pass
+            user_label = str(user_id)
             
-            await asyncio.sleep(2)
-
-        # ✅ SÜRE: 12 SAAT (43200 Saniye)
-        print("✅ Tur bitti. 12 SAAT mola...")
-        await asyncio.sleep(43200)
+            try:
+                # Fetch and send stories
+                print(f"\n🔍 Checking {user_label} stories...")
+                stories = get_user_stories(cl, user_id)
+                
+                if stories:
+                    print(f"   Found {len(stories)} story/stories")
+                    for story in stories:
+                        await send_story_media(cl, story, user_label)
+                else:
+                    print(f"   No stories found")
+                
+                await asyncio.sleep(2)
+                
+                # Fetch and send posts
+                print(f"🔍 Checking {user_label} posts...")
+                posts = get_user_posts(cl, user_id, amount=2)
+                
+                if posts:
+                    print(f"   Found {len(posts)} post(s)")
+                    for post in posts:
+                        await process_and_send_post(cl, post, user_label)
+                else:
+                    print(f"   No posts found")
+                
+                await asyncio.sleep(3)
+                
+            except PleaseWaitFewMinutes:
+                print(f"⚠️ Rate limited! Waiting 5 minutes...")
+                await asyncio.sleep(300)
+            except Exception as e:
+                print(f"⚠️ Error processing user {user_label}: {e}")
+                continue
+        
+        # Wait 12 hours before next check
+        print(f"\n✅ Loop completed! Waiting 12 hours until next check...")
+        print(f"   Next check at: {datetime.fromtimestamp(time.time() + 43200).strftime('%Y-%m-%d %H:%M:%S')}")
+        await asyncio.sleep(43200)  # 12 hours
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n⏹️ Bot stopped by user")
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
   
