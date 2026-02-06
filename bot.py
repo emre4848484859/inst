@@ -1,210 +1,292 @@
-import requests
 import asyncio
 import os
 import random
+import time
+from dataclasses import dataclass
+
+from instagrapi import Client
+from instagrapi.exceptions import ChallengeRequired, LoginRequired, TwoFactorRequired
 from telegram import Bot
 
-# --- 🔐 ANAHTAR HAVUZU (EN ÖNEMLİ KISIM) ---
-# Guerrilla Mail ile aldığın keyleri tırnak içinde, virgülle ayırarak yapıştır.
-API_KEYS = [
-    "0c01188cb4msh74b0acfcc245125p11b555jsn24b92abc748f", # Senin mevcut keyin
-    "KEY_2_BURAYA_YAPISTIR",
-    "KEY_3_BURAYA_YAPISTIR",
-    "KEY_4_BURAYA_YAPISTIR",
-    "KEY_5_BURAYA_YAPISTIR",
-    "KEY_6_BURAYA_YAPISTIR",
-    "KEY_7_BURAYA_YAPISTIR",
-    "KEY_8_BURAYA_YAPISTIR",
-    "KEY_9_BURAYA_YAPISTIR",
-    "KEY_10_BURAYA_YAPISTIR"
+
+DEFAULT_TARGET_IDS = [
+    "9158581810",
+    "8540571400",
+    "56893406476",
+    "52778386307",
+    "45521544431",
+    "8916182875",
+    "15181547765",
+    "2859988906",
+    "67619369047",
 ]
 
-# Ayarlar
-RAPID_API_HOST = "starapi1.p.rapidapi.com"
-TELEGRAM_TOKEN = "8502372148:AAGqwcMrkXMasZEhABLmHaE2HKLxOYeRjIY"
-CHAT_ID = "7075582251"
 
-# Hedef ID Listesi (Senin verdiğin ID'ler)
-TARGET_IDS = [
-    "9158581810", "8540571400", "56893406476", "52778386307", 
-    "45521544431", "8916182875", "15181547765", "2859988906", "67619369047"
-]
+@dataclass(frozen=True)
+class Config:
+    telegram_token: str
+    telegram_chat_id: str
+    ig_username: str
+    ig_password: str
+    ig_session_file: str
+    history_file: str
+    poll_interval_seconds: int
+    per_account_delay_seconds: float
+    jitter_seconds: float
+    target_ids: list[str]
 
-HISTORY_FILE = "gecmis_final.txt"
 
-# --- YARDIMCI FONKSİYONLAR ---
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
 
-def get_random_header():
-    """Havuzdan çalışan rastgele bir key seçer."""
-    # Placeholder (BURAYA...) olanları filtrele
-    valid_keys = [k for k in API_KEYS if "BURAYA" not in k and len(k) > 10]
-    
-    if not valid_keys:
-        print("❌ HATA: Listede hiç geçerli API Key yok! Lütfen bot.py dosyasını düzenle.")
-        return None
 
-    selected_key = random.choice(valid_keys)
-    return {
-        "x-rapidapi-key": selected_key,
-        "x-rapidapi-host": RAPID_API_HOST,
-        "Content-Type": "application/json"
-    }
+def load_config() -> Config:
+    """
+    Required env vars:
+    - TELEGRAM_TOKEN
+    - TELEGRAM_CHAT_ID
+    - IG_USERNAME
+    - IG_PASSWORD
+    Optional:
+    - IG_SESSION_FILE (default: ig_session.json)
+    - HISTORY_FILE (default: gecmis_final.txt)
+    - TARGET_IDS (comma-separated numeric IDs)
+    - POLL_INTERVAL_SECONDS (default: 900)
+    - PER_ACCOUNT_DELAY_SECONDS (default: 2)
+    - JITTER_SECONDS (default: 1)
+    """
+    telegram_token = _env("TELEGRAM_TOKEN")
+    telegram_chat_id = _env("TELEGRAM_CHAT_ID")
+    ig_username = _env("IG_USERNAME")
+    ig_password = _env("IG_PASSWORD")
 
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r") as f:
-            return set(line.strip() for line in f)
+    missing = []
+    if not telegram_token:
+        missing.append("TELEGRAM_TOKEN")
+    if not telegram_chat_id:
+        missing.append("TELEGRAM_CHAT_ID")
+    if not ig_username:
+        missing.append("IG_USERNAME")
+    if not ig_password:
+        missing.append("IG_PASSWORD")
+    if missing:
+        raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
+
+    ig_session_file = _env("IG_SESSION_FILE", "ig_session.json")
+    history_file = _env("HISTORY_FILE", "gecmis_final.txt")
+
+    poll_interval_seconds = int(_env("POLL_INTERVAL_SECONDS", "900"))
+    per_account_delay_seconds = float(_env("PER_ACCOUNT_DELAY_SECONDS", "2"))
+    jitter_seconds = float(_env("JITTER_SECONDS", "1"))
+
+    target_ids_raw = _env("TARGET_IDS", "")
+    if target_ids_raw:
+        target_ids = [x.strip() for x in target_ids_raw.split(",") if x.strip()]
+    else:
+        target_ids = DEFAULT_TARGET_IDS[:]
+
+    return Config(
+        telegram_token=telegram_token,
+        telegram_chat_id=telegram_chat_id,
+        ig_username=ig_username,
+        ig_password=ig_password,
+        ig_session_file=ig_session_file,
+        history_file=history_file,
+        poll_interval_seconds=poll_interval_seconds,
+        per_account_delay_seconds=per_account_delay_seconds,
+        jitter_seconds=jitter_seconds,
+        target_ids=target_ids,
+    )
+
+
+def load_history(path: str) -> set[str]:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
     return set()
 
-def save_to_history(media_id):
-    with open(HISTORY_FILE, "a") as f:
+
+def save_to_history(path: str, media_id: str) -> None:
+    with open(path, "a", encoding="utf-8") as f:
         f.write(f"{media_id}\n")
 
-SENT_IDS = load_history()
 
-try:
-    bot = Bot(token=TELEGRAM_TOKEN)
-except Exception as e:
-    print(f"Bot token hatası: {e}")
-    exit()
-
-# --- İSTEK FONKSİYONLARI ---
-
-def get_stories(user_id):
-    url = f"https://{RAPID_API_HOST}/instagram/user/get_stories"
-    payload = {"ids": [user_id]}
-    header = get_random_header()
-    if not header: return None
-
+def build_ig_client(username: str, password: str, session_file: str) -> Client:
+    """
+    Login and cache session/settings.
+    Notes:
+    - Instagram may request Challenge/2FA; this needs manual completion in-app.
+    - Session file is persisted so subsequent runs reduce login frequency.
+    """
+    cl = Client()
+    if session_file and os.path.exists(session_file):
+        try:
+            cl.load_settings(session_file)
+        except Exception:
+            pass
     try:
-        response = requests.post(url, json=payload, headers=header, timeout=30)
-        if response.status_code == 429:
-            print("⚠️ Bir anahtarın kotası doldu, diğer turda başkası seçilecek.")
-        return response.json()
-    except:
-        return None
+        cl.login(username, password)
+        if session_file:
+            cl.dump_settings(session_file)
+    except TwoFactorRequired as e:
+        raise RuntimeError(
+            "Instagram 2FA istiyor. Önce hesabı Instagram uygulamasında doğrula "
+            "veya istersen 2FA kod akışını koda ekleyebilirim."
+        ) from e
+    except ChallengeRequired as e:
+        raise RuntimeError(
+            "Instagram 'challenge' (şüpheli giriş) istiyor. Instagram uygulamasından girip "
+            "challenge'ı tamamla, sonra tekrar çalıştır."
+        ) from e
+    except LoginRequired as e:
+        raise RuntimeError(
+            "Instagram login başarısız. Kullanıcı adı/şifre doğru mu? Challenge/2FA olabilir."
+        ) from e
+    return cl
 
-def get_posts(user_id):
-    url = f"https://{RAPID_API_HOST}/instagram/user/get_media"
-    payload = {"id": user_id, "count": 2}
-    header = get_random_header()
-    if not header: return None
-
-    try:
-        response = requests.post(url, json=payload, headers=header, timeout=30)
-        return response.json()
-    except:
-        return None
 
 def extract_media_url(item):
-    video_url = None
-    image_url = None
-    
-    if 'video_versions' in item:
-        video_url = item['video_versions'][0]['url']
-    elif item.get('video_url'):
-        video_url = item['video_url']
-
-    if not video_url:
-        if 'image_versions2' in item:
-            candidates = item['image_versions2'].get('candidates', [])
-            if candidates: image_url = candidates[0]['url']
-        elif 'display_url' in item:
-            image_url = item['display_url']
-            
+    """
+    Extract URLs from instagrapi Media/Story/Resource models.
+    Telegram will download from these URLs.
+    """
+    video_url = getattr(item, "video_url", None) or None
+    image_url = getattr(item, "thumbnail_url", None) or getattr(item, "url", None) or None
     return video_url, image_url
 
-async def process_and_send_post(post_item, user_label):
-    post_id = str(post_item.get('pk') or post_item.get('id'))
-    
-    if post_id in SENT_IDS: return
 
-    print(f"   ✨ Yeni Post: {user_label}")
+async def process_and_send_post(
+    bot: Bot,
+    cfg: Config,
+    sent_ids: set[str],
+    post_item,
+    user_label: str,
+):
+    post_id = str(getattr(post_item, "pk", None) or getattr(post_item, "id", None))
+    if post_id in sent_ids:
+        return
 
-    if 'carousel_media' in post_item and post_item['carousel_media']:
-        album = post_item['carousel_media']
-        total_slides = len(album)
-        
-        for i, slide in enumerate(album, 1):
+    print(f"   ✨ Yeni Post: {user_label} ({post_id})")
+
+    resources = getattr(post_item, "resources", None) or []
+    if resources:
+        total_slides = len(resources)
+        for i, slide in enumerate(resources, 1):
             vid, img = extract_media_url(slide)
             caption = f"📮 Post (ID: {user_label}) - {i}/{total_slides}"
             try:
-                if vid: await bot.send_video(chat_id=CHAT_ID, video=vid, caption=caption)
-                elif img: await bot.send_photo(chat_id=CHAT_ID, photo=img, caption=caption)
-                await asyncio.sleep(1) 
-            except: pass
+                if vid:
+                    await bot.send_video(chat_id=cfg.telegram_chat_id, video=vid, caption=caption)
+                elif img:
+                    await bot.send_photo(chat_id=cfg.telegram_chat_id, photo=img, caption=caption)
+                await asyncio.sleep(1)
+            except Exception:
+                pass
     else:
         vid, img = extract_media_url(post_item)
         caption = f"📮 Post (ID: {user_label})"
         try:
-            if vid: await bot.send_video(chat_id=CHAT_ID, video=vid, caption=caption)
-            elif img: await bot.send_photo(chat_id=CHAT_ID, photo=img, caption=caption)
-        except: pass
+            if vid:
+                await bot.send_video(chat_id=cfg.telegram_chat_id, video=vid, caption=caption)
+            elif img:
+                await bot.send_photo(chat_id=cfg.telegram_chat_id, photo=img, caption=caption)
+        except Exception:
+            pass
 
-    SENT_IDS.add(post_id)
-    save_to_history(post_id)
+    sent_ids.add(post_id)
+    save_to_history(cfg.history_file, post_id)
 
-async def send_story_media(media_item, caption):
-    media_id = str(media_item.get('pk') or media_item.get('id'))
-    if media_id in SENT_IDS: return
+
+async def send_story_media(
+    bot: Bot,
+    cfg: Config,
+    sent_ids: set[str],
+    media_item,
+    caption: str,
+):
+    media_id = str(getattr(media_item, "pk", None) or getattr(media_item, "id", None))
+    if media_id in sent_ids:
+        return
 
     vid, img = extract_media_url(media_item)
     try:
         if vid:
-            print(f"   📹 Story (Video)...")
-            await bot.send_video(chat_id=CHAT_ID, video=vid, caption=caption)
+            print("   📹 Story (Video)...")
+            await bot.send_video(chat_id=cfg.telegram_chat_id, video=vid, caption=caption)
         elif img:
-            print(f"   📸 Story (Foto)...")
-            await bot.send_photo(chat_id=CHAT_ID, photo=img, caption=caption)
-        SENT_IDS.add(media_id)
-        save_to_history(media_id)
+            print("   📸 Story (Foto)...")
+            await bot.send_photo(chat_id=cfg.telegram_chat_id, photo=img, caption=caption)
+        sent_ids.add(media_id)
+        save_to_history(cfg.history_file, media_id)
         await asyncio.sleep(2)
-    except: pass
+    except Exception:
+        pass
+
 
 async def main():
-    print("🚀 Bot Başlatıldı (API HAVUZ MODU)...")
-    
-    active_keys = [k for k in API_KEYS if 'BURAYA' not in k]
-    print(f"🔑 Aktif Key Sayısı: {len(active_keys)}")
-    
-    if len(active_keys) < 2:
-        print("⚠️ UYARI: Çok az key var! Lütfen Guerrilla Mail ile alıp listeyi doldur.")
+    cfg = load_config()
+    sent_ids = load_history(cfg.history_file)
 
-    print(f"👤 Hedef ID Sayısı: {len(TARGET_IDS)}")
+    bot = Bot(token=cfg.telegram_token)
+
+    print("🚀 Bot Başlatıldı (ÜCRETSİZ IG SESSION MODU)")
+    print(f"👤 Hedef ID Sayısı: {len(cfg.target_ids)}")
+    print(
+        f"⏱️ Poll: {cfg.poll_interval_seconds}s | "
+        f"Account delay: {cfg.per_account_delay_seconds}s | Jitter: {cfg.jitter_seconds}s"
+    )
+    print("🔐 Instagram login başlıyor...")
+
+    cl = await asyncio.to_thread(build_ig_client, cfg.ig_username, cfg.ig_password, cfg.ig_session_file)
+    print("✅ Instagram login OK.")
     print("-" * 30)
-    
+
+    # Basit backoff: hata olursa bekleme süresini arttır, sonra toparla.
+    backoff = 0.0
+
     while True:
-        for user_id in TARGET_IDS:
-            user_label = str(user_id) 
+        loop_started = time.time()
+        any_error = False
 
-            # Story
+        for user_id in cfg.target_ids:
+            user_label = str(user_id)
+            uid = int(user_id)
+
             print(f"🔍 {user_label} story...")
-            s_data = get_stories(user_id)
-            if s_data:
-                try:
-                    reels = s_data.get('response', {}).get('body', {}).get('reels', {})
-                    items = reels.get(str(user_id), {}).get('items', [])
-                    for item in items: await send_story_media(item, f"🔔 Story (ID: {user_label})")
-                except: pass
+            try:
+                stories = await asyncio.to_thread(cl.user_stories, uid)
+                for story in stories:
+                    await send_story_media(bot, cfg, sent_ids, story, f"🔔 Story (ID: {user_label})")
+            except Exception as e:
+                any_error = True
+                print(f"⚠️ Story hata ({user_label}): {e}")
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(cfg.per_account_delay_seconds + random.random() * cfg.jitter_seconds)
 
-            # Post
             print(f"🔍 {user_label} post...")
-            p_data = get_posts(user_id)
-            if p_data:
-                try:
-                    items = p_data.get('response', {}).get('body', {}).get('items', [])
-                    for item in items: await process_and_send_post(item, user_label)
-                except: pass
-            
-            await asyncio.sleep(2)
+            try:
+                medias = await asyncio.to_thread(cl.user_medias, uid, 2)
+                for media in medias:
+                    await process_and_send_post(bot, cfg, sent_ids, media, user_label)
+            except Exception as e:
+                any_error = True
+                print(f"⚠️ Post hata ({user_label}): {e}")
 
-        # ✅ SÜRE: 12 SAAT (43200 Saniye)
-        print("✅ Tur bitti. 12 SAAT mola...")
-        await asyncio.sleep(43200)
+            await asyncio.sleep(cfg.per_account_delay_seconds + random.random() * cfg.jitter_seconds)
+
+        elapsed = int(time.time() - loop_started)
+        print(f"✅ Tur bitti. Süre: {elapsed}s")
+
+        if any_error:
+            backoff = min(max(5.0, backoff * 2 if backoff else 5.0), 600.0)
+        else:
+            backoff = max(0.0, backoff / 2)
+
+        sleep_for = max(0, cfg.poll_interval_seconds + backoff)
+        print(f"🕒 Mola: {sleep_for:.0f}s (backoff={backoff:.0f}s)")
+        await asyncio.sleep(sleep_for)
+
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
-  
+    asyncio.run(main())
+
